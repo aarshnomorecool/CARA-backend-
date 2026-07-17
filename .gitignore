@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.pkl
+.pytest_cache/
+
+# Regenerable via `python -m ml.synthesize_data` — don't version 65MB of
+# synthetic rows. The trained model + feature_columns.json ARE committed,
+# since the deployed app needs to load them at startup.
+ml/artifacts/training_data.csv
+.claude/
+
+# App Engine config holds real secrets (DATABASE_URL, API keys) via
+# env_variables - same reasoning as .env above. app.yaml.example is committed.
+app.yaml

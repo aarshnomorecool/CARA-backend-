@@ -1,0 +1,20 @@
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sqlalchemy>=2.0
+psycopg[binary]>=3.2
+alembic>=1.14
+pydantic>=2.9
+pydantic-settings>=2.6
+email-validator>=2.2
+python-dotenv>=1.0
+bcrypt>=4.2
+
+# ML training (offline, run manually — see ml/)
+xgboost>=2.1
+scikit-learn>=1.5
+numpy>=2.0
+pandas>=2.2
+odfpy>=1.4
+
+# Explainability (live, used by app/services/explain.py)
+shap>=0.46
