@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.database import get_db
 from app.models.place import Place
+from app.schemas.place import PlaceRead
 
 router = APIRouter(prefix="/places", tags=["places"])
 
@@ -63,6 +64,21 @@ def _refresh_photo_reference(google_place_id: str) -> str | None:
         data = json.loads(resp.read())
     photos = data.get("result", {}).get("photos") or []
     return photos[0]["photo_reference"] if photos else None
+
+
+@router.get("/{place_id}", response_model=PlaceRead)
+def get_place(place_id: int, db: Session = Depends(get_db)) -> Place:
+    """Standalone place lookup by ID - independent of any /recommendations
+    response. Place Details needs this regardless of navigation source (Home,
+    Saved, or a future deep link): the RecommendationCache it also reads from
+    is only ever populated by /recommendations, so anything opened from
+    Saved (which only has place_id + a smaller field set from
+    /users/{id}/saved-places) previously had nowhere to fetch full place data
+    from and showed "Place not found" even for places that exist fine."""
+    place = db.get(Place, place_id)
+    if place is None:
+        raise HTTPException(status_code=404, detail="Place not found")
+    return place
 
 
 @router.get("/{place_id}/photo")
