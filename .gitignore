@@ -12,6 +12,6 @@ venv/
 ml/artifacts/training_data.csv
 .claude/
 
-# App Engine config holds real secrets (DATABASE_URL, API keys) via
-# env_variables - same reasoning as .env above. app.yaml.example is committed.
-app.yaml
+# Cloud Run --env-vars-file holds real secrets (DATABASE_URL, API keys) -
+# same reasoning as .env above. env.yaml.example is committed.
+env.yaml
