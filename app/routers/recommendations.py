@@ -36,6 +36,16 @@ GEOFENCE_RADIUS_KM = 0.1  # 100m, per CLAUDE(CARA-BACKEND).md's semantic locatio
 DEFAULT_PREFERENCE_WEIGHT = 1 / len(CATEGORIES)  # cold-start users have no preference rows yet
 DEFAULT_RATING = 3.5
 TOP_N = 20
+# Caps a single category's share of results when NO mood/need is active
+# (neutral has no legitimate reason to be single-category - unlike e.g.
+# "hungry", where restaurant/cafe SHOULD dominate via EMOTION_CATEGORY_BONUS
+# below, so this cap deliberately doesn't apply there). Guards against
+# preference_weight or crowd_score alone ever collapsing a neutral feed into
+# one category - real bug, 2026-07-17: a skewed hospital preference_weight
+# (itself caused by a since-fixed bug, see app/services/preferences.py)
+# pushed hospitals to dominate neutral-mood results with zero ranking-level
+# safety net to catch it.
+MAX_PER_CATEGORY_NEUTRAL = 6
 
 
 def _time_slot(now: datetime) -> str:
@@ -47,6 +57,27 @@ def _time_slot(now: datetime) -> str:
     if 17 <= hour < 21:
         return "evening"
     return "night"
+
+
+def _cap_per_category(scored: list, top_n: int, max_per_category: int) -> list:
+    """Walks the score-sorted candidate list greedily, skipping any
+    candidate whose category has already hit max_per_category, so the
+    result stays ranked-best-first within the cap. Backfills with the
+    skipped overflow if the cap left fewer than top_n results (e.g. too few
+    distinct categories nearby) rather than under-filling the response."""
+    counts: dict[str, int] = {}
+    selected, overflow = [], []
+    for item in scored:
+        category = item[2]["category"]
+        if counts.get(category, 0) < max_per_category:
+            selected.append(item)
+            counts[category] = counts.get(category, 0) + 1
+        else:
+            overflow.append(item)
+        if len(selected) == top_n:
+            return selected
+    selected.extend(overflow[: top_n - len(selected)])
+    return selected
 
 
 def _semantic_location(
@@ -153,7 +184,7 @@ def get_recommendations(
         ]
 
     scored = sorted(zip(scores, candidates, feature_rows), key=lambda t: t[0], reverse=True)
-    top = scored[:TOP_N]
+    top = scored[:TOP_N] if emotion_bonus_map else _cap_per_category(scored, TOP_N, MAX_PER_CATEGORY_NEUTRAL)
 
     # SHAP only runs on the already-ranked top-N, per CLAUDE.md's Core
     # Request Flow step 6 - explaining every discarded candidate would be

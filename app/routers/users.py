@@ -10,6 +10,7 @@ from app.models.user import User
 from app.schemas.place import PlaceRead
 from app.schemas.preference import PreferenceRead
 from app.schemas.user import LocationUpdate, UserRead
+from app.services.preferences import recompute_preference
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -58,7 +59,10 @@ def get_saved_places(user_id: int, db: Session = Depends(get_db)) -> list[Place]
 
 @router.delete("/{user_id}/saved-places/{place_id}", status_code=204)
 def delete_saved_place(user_id: int, place_id: int, db: Session = Depends(get_db)) -> Response:
-    """Removes a bookmark by deleting the underlying bookmark interaction(s).
+    """Removes a bookmark by deleting the underlying bookmark interaction(s),
+    then recomputes that place's category preference weight so the removed
+    bookmark's influence is actually undone rather than permanently baked in
+    - see app/services/preferences.py's docstring for the bug this fixes.
 
     Idempotent - unbookmarking something that was never bookmarked still
     returns 204, since the caller's desired end state ("not in Saved") is
@@ -67,6 +71,8 @@ def delete_saved_place(user_id: int, place_id: int, db: Session = Depends(get_db
     if db.get(User, user_id) is None:
         raise HTTPException(status_code=404, detail="User not found")
 
+    place = db.get(Place, place_id)
+
     db.execute(
         delete(Interaction).where(
             Interaction.user_id == user_id,
@@ -74,6 +80,10 @@ def delete_saved_place(user_id: int, place_id: int, db: Session = Depends(get_db
             Interaction.action == InteractionAction.bookmark,
         )
     )
+
+    if place is not None:
+        recompute_preference(db, user_id, place.category)
+
     db.commit()
     return Response(status_code=204)
 
