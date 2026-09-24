@@ -8,11 +8,12 @@ CLAUDE(CARA-BACKEND).md's Secrets rule).
 """
 
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
 from app.config import settings
@@ -25,6 +26,24 @@ router = APIRouter(prefix="/places", tags=["places"])
 PLACE_PHOTO_URL = "https://maps.googleapis.com/maps/api/place/photo"
 PLACE_DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
 MAX_WIDTH = 800
+# Clients ask for the size they actually draw (e.g. ~400px for a card
+# thumbnail vs ~1000px for a full-bleed hero) - a thumbnail at 800px was
+# ~155KB each and the main cause of slow-loading card rows.
+MIN_REQUESTED_WIDTH = 200
+MAX_REQUESTED_WIDTH = 1200
+
+# Lets the phone keep each photo in its own image cache (Coil) for a day
+# instead of re-downloading it through Google on every screen visit. This is
+# client-side only - the server still never stores image bytes (ToS note in
+# the module docstring).
+PHOTO_CACHE_HEADERS = {"Cache-Control": "private, max-age=86400"}
+NO_PHOTO_CACHE_HEADERS = {"Cache-Control": "private, max-age=3600"}
+
+# place_id -> monotonic time we learned it has no usable photo. ~1 in 3
+# places has none; without this every visit re-queried Google (Photo +
+# Place Details) just to fail again. Metadata only, never image content.
+NO_PHOTO_TTL_SECONDS = 6 * 60 * 60
+_no_photo: dict[int, float] = {}
 # This is a live proxy behind an interactive scrolling UI - fail fast rather
 # than hang. Google's Photo API is normally well under 2s; anything slower
 # than this is unlikely to succeed anyway.
@@ -39,9 +58,9 @@ _REFERENCE_ERRORS = (urllib.error.HTTPError,)
 _TRANSIENT_ERRORS = (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, IndexError)
 
 
-def _fetch_photo(photo_reference: str) -> tuple[bytes, str]:
+def _fetch_photo(photo_reference: str, max_width: int = MAX_WIDTH) -> tuple[bytes, str]:
     params = {
-        "maxwidth": MAX_WIDTH,
+        "maxwidth": max_width,
         "photo_reference": photo_reference,
         "key": settings.google_places_api_key,
     }
@@ -81,31 +100,49 @@ def get_place(place_id: int, db: Session = Depends(get_db)) -> Place:
     return place
 
 
+def _no_photo_response(place_id: int) -> HTTPException:
+    _no_photo[place_id] = time.monotonic()
+    return HTTPException(status_code=404, detail="No photo available", headers=NO_PHOTO_CACHE_HEADERS)
+
+
 @router.get("/{place_id}/photo")
-def get_place_photo(place_id: int, db: Session = Depends(get_db)) -> Response:
+def get_place_photo(
+    place_id: int,
+    w: int = Query(default=MAX_WIDTH, description="Desired image width in px"),
+    db: Session = Depends(get_db),
+) -> Response:
+    width = max(MIN_REQUESTED_WIDTH, min(MAX_REQUESTED_WIDTH, w))
+
+    known_missing_at = _no_photo.get(place_id)
+    if known_missing_at is not None and time.monotonic() - known_missing_at < NO_PHOTO_TTL_SECONDS:
+        raise HTTPException(status_code=404, detail="No photo available", headers=NO_PHOTO_CACHE_HEADERS)
+
     place = db.get(Place, place_id)
     if place is None:
         raise HTTPException(status_code=404, detail="Place not found")
 
     if place.photo_reference:
         try:
-            image_bytes, content_type = _fetch_photo(place.photo_reference)
-            return Response(content=image_bytes, media_type=content_type)
+            image_bytes, content_type = _fetch_photo(place.photo_reference, width)
+            return Response(content=image_bytes, media_type=content_type, headers=PHOTO_CACHE_HEADERS)
         except _REFERENCE_ERRORS:
             pass  # likely expired - fall through and try to refresh it
         except _TRANSIENT_ERRORS:
+            # Network blip, not a missing photo - don't remember it as missing.
             raise HTTPException(status_code=404, detail="No photo available")
 
     if not place.google_place_id:
-        raise HTTPException(status_code=404, detail="No photo available")
+        raise _no_photo_response(place_id)
 
     try:
         fresh_reference = _refresh_photo_reference(place.google_place_id)
     except _TRANSIENT_ERRORS:
         raise HTTPException(status_code=404, detail="No photo available")
+    except _REFERENCE_ERRORS:
+        raise _no_photo_response(place_id)
 
     if not fresh_reference:
-        raise HTTPException(status_code=404, detail="No photo available")
+        raise _no_photo_response(place_id)
 
     # Opportunistically heal the stored reference so future requests for
     # this place don't have to hit Place Details again.
@@ -113,7 +150,9 @@ def get_place_photo(place_id: int, db: Session = Depends(get_db)) -> Response:
     db.commit()
 
     try:
-        image_bytes, content_type = _fetch_photo(fresh_reference)
-        return Response(content=image_bytes, media_type=content_type)
-    except (*_REFERENCE_ERRORS, *_TRANSIENT_ERRORS):
+        image_bytes, content_type = _fetch_photo(fresh_reference, width)
+        return Response(content=image_bytes, media_type=content_type, headers=PHOTO_CACHE_HEADERS)
+    except _REFERENCE_ERRORS:
+        raise _no_photo_response(place_id)
+    except _TRANSIENT_ERRORS:
         raise HTTPException(status_code=404, detail="No photo available")
