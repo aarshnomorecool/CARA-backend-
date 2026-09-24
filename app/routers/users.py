@@ -9,18 +9,95 @@ from app.models.preference import Preference
 from app.models.user import User
 from app.schemas.place import PlaceRead
 from app.schemas.preference import PreferenceRead
-from app.schemas.user import LocationUpdate, UserRead
+from app.routers.auth import _hash_password, _verify_password
+from app.schemas.user import LocationUpdate, PasswordChange, UserRead, UserStats, UserUpdate
 from app.services.preferences import recompute_preference
 
 router = APIRouter(prefix="/users", tags=["users"])
 
 
-@router.get("/{user_id}", response_model=UserRead)
-def get_user(user_id: int, db: Session = Depends(get_db)) -> User:
+def _get_user_or_404(db: Session, user_id: int) -> User:
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
+
+@router.get("/{user_id}", response_model=UserRead)
+def get_user(user_id: int, db: Session = Depends(get_db)) -> User:
+    return _get_user_or_404(db, user_id)
+
+
+@router.patch("/{user_id}", response_model=UserRead)
+def update_user(user_id: int, payload: UserUpdate, db: Session = Depends(get_db)) -> User:
+    """Edit profile from the Android Profile screen. budget_default feeds
+    straight into GET /recommendations whenever the client sends no explicit
+    budget, so changing it here changes what Home ranks."""
+    user = _get_user_or_404(db, user_id)
+    fields = payload.model_fields_set
+    if "name" in fields and payload.name is not None:
+        user.name = payload.name.strip()
+    if "budget_default" in fields:
+        user.budget_default = payload.budget_default
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+@router.put("/{user_id}/password", status_code=204)
+def change_password(user_id: int, payload: PasswordChange, db: Session = Depends(get_db)) -> Response:
+    user = _get_user_or_404(db, user_id)
+    if user.password_hash is None or not _verify_password(payload.current_password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+    user.password_hash = _hash_password(payload.new_password)
+    db.commit()
+    return Response(status_code=204)
+
+
+@router.get("/{user_id}/stats", response_model=UserStats)
+def get_user_stats(user_id: int, db: Session = Depends(get_db)) -> UserStats:
+    """Headline numbers for the Profile screen - all derived from the
+    interactions log, nothing stored separately."""
+    user = _get_user_or_404(db, user_id)
+
+    saved_count = db.execute(
+        select(func.count(func.distinct(Interaction.place_id))).where(
+            Interaction.user_id == user_id, Interaction.action == InteractionAction.bookmark
+        )
+    ).scalar_one()
+    interaction_count = db.execute(
+        select(func.count()).select_from(Interaction).where(Interaction.user_id == user_id)
+    ).scalar_one()
+    places_explored = db.execute(
+        select(func.count(func.distinct(Interaction.place_id))).where(Interaction.user_id == user_id)
+    ).scalar_one()
+    top_category = db.execute(
+        select(Preference.category)
+        .where(Preference.user_id == user_id)
+        .order_by(Preference.weight.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    return UserStats(
+        saved_count=saved_count,
+        interaction_count=interaction_count,
+        places_explored=places_explored,
+        top_category=top_category.value if hasattr(top_category, "value") else top_category,
+        member_since=user.created_at,
+    )
+
+
+@router.delete("/{user_id}", status_code=204)
+def delete_user(user_id: int, db: Session = Depends(get_db)) -> Response:
+    """Permanently deletes the account and everything tied to it
+    (interactions, learned preferences). Irreversible - the Android client
+    gates this behind a typed confirmation dialog."""
+    user = _get_user_or_404(db, user_id)
+    db.execute(delete(Interaction).where(Interaction.user_id == user_id))
+    db.execute(delete(Preference).where(Preference.user_id == user_id))
+    db.delete(user)
+    db.commit()
+    return Response(status_code=204)
 
 
 @router.get("/{user_id}/preferences", response_model=list[PreferenceRead])
